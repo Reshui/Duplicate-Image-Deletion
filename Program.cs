@@ -1,9 +1,9 @@
 ﻿// See https://aka.ms/new-console-template for more information
 using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
-//using System.Collections.Concurrent;
-
 using SQL_Functions;
+using System.Threading.Tasks.Dataflow;
+using System.Collections.Concurrent;
 
 string imgFolder = Environment.GetFolderPath(Environment.SpecialFolder.Desktop) + @"\Images\Foo";
 
@@ -20,33 +20,44 @@ using (var connection = new SqliteConnection($"Data Source={databaseName};Cache=
 
     HashSet<string> fileInDatabase = sqlC.GetAllFilePathsInDatabase();
     // Filter for images that haven't been processed.
-    imgPaths = imgPaths.Where(x => !fileInDatabase.Contains(x)).ToList();
+    var newImagePaths = imgPaths.Where(x => !fileInDatabase.Contains(x));
 
-    var imgFileData = new List<FileData>();
+    var getBytesBlock = new TransformBlock<string, FileData>(filePath => new FileData(false, false, filePath, null, rawBytes: File.ReadAllBytes(filePath)));
 
-    using (var myHash = SHA512.Create())
+    ConcurrentBag<FileData> completedHashes = new();
+    var computeHashBlock = new ActionBlock<FileData>((queriedFile) =>
     {
-        foreach (var img in imgPaths)
+        if (queriedFile.RawBytes != null)
         {
-            using (var stream = File.OpenRead(img))
-            {
-                byte[] computedHash = myHash.ComputeHash(stream);
-                imgFileData.Add(new FileData(false, false, img, computedHash));
-            }
+            using var myHash = SHA512.Create();
+            queriedFile.HashCode = myHash.ComputeHash(queriedFile.RawBytes);
+            completedHashes.Add(queriedFile);
         }
-    }
+    }, new ExecutionDataflowBlockOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, BoundedCapacity = 50 });
 
-    if (imgFileData.Count > 0) sqlC.BulkInsertToDatabase(imgFileData);
+    getBytesBlock.LinkTo(computeHashBlock, new DataflowLinkOptions { PropagateCompletion = true });
 
-    Dictionary<byte[], List<FileData>> duplicatedFiles = sqlC.FilesWithDuplicates();
-
-    string fileCountStatement = $"New Images: {imgFileData.Count}\t";
-
-    if (duplicatedFiles.Count > 0)
+    // Calculate the hash codes for the new images and store them in a FileData object.
+    foreach (string imgPath in newImagePaths)
     {
-        foreach (List<FileData> item in duplicatedFiles.Values)
+        await getBytesBlock.SendAsync(imgPath);
+    }
+    getBytesBlock.Complete();
+    await computeHashBlock.Completion;
+
+    if (!completedHashes.IsEmpty)
+    {
+        sqlC.BulkInsertToDatabase(completedHashes);
+    }
+    Console.WriteLine($"New Images: {completedHashes.Count}\t");
+
+    Dictionary<byte[], List<FileData>> duplicatedFilesByHashCode = sqlC.FilesWithDuplicates();
+
+    if (duplicatedFilesByHashCode.Count > 0)
+    {
+        foreach (List<FileData> item in duplicatedFilesByHashCode.Values)
         {   // Loop is initialized at 1 to retain at least 1 image.
-            for (int i = 1; i < item.Count; i++)
+            for (int i = 1; i < item.Count; ++i)
             {
                 FileData file = item[i];
 
@@ -55,7 +66,7 @@ using (var connection = new SqliteConnection($"Data Source={databaseName};Cache=
             }
         }
 
-        List<FileData> filesToDelete = (from duplicatedList in duplicatedFiles.Values
+        List<FileData> filesToDelete = (from duplicatedList in duplicatedFilesByHashCode.Values
                                         from file in duplicatedList
                                         where file.MarkedForDeletion == true
                                         select file).ToList();
@@ -64,17 +75,13 @@ using (var connection = new SqliteConnection($"Data Source={databaseName};Cache=
 
         try
         {
-            Console.WriteLine($"{fileCountStatement} Images Deleted: {filesToDelete.Count}\nPress any key to continue.");
+            Console.WriteLine($"Images Deleted: {filesToDelete.Count}\nPress any key to continue.");
             Console.ReadKey();
         }
         catch (InvalidOperationException)
         {
 
         }
-    }
-    else
-    {
-        Console.WriteLine(fileCountStatement);
     }
 }
 

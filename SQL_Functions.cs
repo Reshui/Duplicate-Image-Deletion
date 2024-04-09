@@ -1,5 +1,6 @@
 namespace SQL_Functions;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 
 public class SQL_Connector
 {
@@ -45,88 +46,64 @@ public class SQL_Connector
     {
         bool imgInDatabase = false;
         bool hashFound = false;
+        var command = Connection.CreateCommand();
 
-        try
-        {
-            var command = Connection.CreateCommand();
-
-            command.CommandText =
-            $@"
+        command.CommandText =
+        $@"
             SELECT FileName, AlternatePath FROM {HashTableName}
             WHERE HashCode = $TestHash;";
 
-            command.Parameters.AddWithValue("$TestHash", hashCode);
+        command.Parameters.AddWithValue("$TestHash", hashCode);
 
-            using (var reader = command.ExecuteReader())
-            {
-                if (reader.HasRows)
+        using var reader = command.ExecuteReader();
+
+        if (reader.HasRows)
+        {
+            string? currentFileName;
+            hashFound = true;
+            string originalFileName;
+
+            while (reader.Read())
+            {   // Now determine if the file path/HashCode is already in the database
+                try
                 {
-                    string? currentFileName;
-                    hashFound = true;
-                    string originalFileName;
+                    originalFileName = reader.GetString(0);
+                }
+                catch (NullReferenceException)
+                {
+                    Console.WriteLine($"Error attempting to get original file name from database: {imgPath}");
+                    throw;
+                }
 
-                    try
+                try
+                {
+                    if (!reader.IsDBNull(1))
                     {
-                        while (reader.Read())
-                        {   // Now determine if the file path/HashCode is already in the database
-                            try
-                            {
-                                originalFileName = reader.GetString(0);
-                            }
-                            catch (NullReferenceException ex)
-                            {
-                                Console.WriteLine($"Error attempting to get original file name from database: {imgPath}");
-                                Console.WriteLine(ex.ToString());
-                                throw ex;
-                            }
-
-                            try
-                            {
-                                if (!reader.IsDBNull(1))
-                                {
-                                    currentFileName = reader.GetString(1);
-                                }
-                                else
-                                {
-                                    currentFileName = null;
-                                }
-                            }
-                            catch (NullReferenceException ex)
-                            {
-                                Console.WriteLine($"Error attempting to get alternate file path from database: {imgPath}");
-                                throw ex;
-                            }
-
-                            if (imgPath == originalFileName || imgPath == currentFileName)
-                            {
-                                imgInDatabase = true;
-                                break;
-                            }
-                        }
+                        currentFileName = reader.GetString(1);
                     }
-                    catch (NullReferenceException ex)
+                    else
                     {
-                        Console.WriteLine("An error ocurred while attempting to call .Read() method.");
-                        Console.WriteLine(ex.ToString());
-                        throw ex;
+                        currentFileName = null;
                     }
+                }
+                catch (NullReferenceException)
+                {
+                    Console.WriteLine($"Error attempting to get alternate file path from database: {imgPath}");
+                    throw;
+                }
 
+                if (imgPath == originalFileName || imgPath == currentFileName)
+                {
+                    imgInDatabase = true;
+                    break;
                 }
             }
-
-        }
-        catch (NullReferenceException ex)
-        {
-            Console.WriteLine("Error attempting to retrieve file paths from database.");
-            Console.WriteLine(ex.ToString());
-
-            throw ex;
         }
         return new FileData(hashFound, imgInDatabase, imgPath, hashCode);
     }
 
     /// <summary>Queries the database for a list of file names currently in the database.</summary>
-    /// <returns>Returns a HashSet of file names.</returns>
+    /// <returns>Returns a <see cref="HashSet{string}"/> of file names.</returns>
     public HashSet<string> GetAllFilePathsInDatabase()
     {
         var filePaths = new HashSet<string>();
@@ -195,42 +172,39 @@ public class SQL_Connector
     /// <param name = "fileDetails">Collection of FileData objects that contain info for new entries to be added.</param>
     public void BulkInsertToDatabase(IEnumerable<FileData> fileDetails)
     {
-        using (var transaction = Connection.BeginTransaction())
-        {
-            using (var command = Connection.CreateCommand())
-            {
-                command.CommandText =
-                @$"INSERT INTO {HashTableName} (FileName, AlternatePathActive, HashCode)
+        using var transaction = Connection.BeginTransaction();
+        using var command = Connection.CreateCommand();
+
+        command.CommandText =
+        @$"INSERT INTO {HashTableName} (FileName, AlternatePathActive, HashCode)
                 VALUES ($filePath, $alternatePathValid, $byteArray);";
 
-                var fileNameParam = command.CreateParameter();
-                var hashCodeParam = command.CreateParameter();
+        var fileNameParam = command.CreateParameter();
+        var hashCodeParam = command.CreateParameter();
 
-                fileNameParam.ParameterName = "$filePath";
-                hashCodeParam.ParameterName = "$byteArray";
+        fileNameParam.ParameterName = "$filePath";
+        hashCodeParam.ParameterName = "$byteArray";
 
-                command.Parameters.AddWithValue("$alternatePathValid", _useOriginal);
-                command.Parameters.Add(fileNameParam);
-                command.Parameters.Add(hashCodeParam);
+        command.Parameters.AddWithValue("$alternatePathValid", _useOriginal);
+        command.Parameters.Add(fileNameParam);
+        command.Parameters.Add(hashCodeParam);
 
-                foreach (FileData imgfile in fileDetails)
-                {
-                    fileNameParam.Value = imgfile.FilePath;
-                    hashCodeParam.Value = imgfile.HashCode;
+        foreach (FileData imgfile in fileDetails)
+        {
+            fileNameParam.Value = imgfile.FilePath;
+            hashCodeParam.Value = imgfile.HashCode;
 
-                    try
-                    {
-                        command.ExecuteNonQueryAsync();
-                    }
-                    catch (SqliteException ex)
-                    {
-                        Console.WriteLine(imgfile.FilePath);
-                        throw ex;
-                    }
-                }
+            try
+            {
+                command.ExecuteNonQueryAsync();
             }
-            transaction.Commit();
+            catch (SqliteException)
+            {
+                Console.WriteLine(imgfile.FilePath);
+                throw;
+            }
         }
+        transaction.Commit();
     }
 
     public void UpdateAlternatePath(List<FileData> fileDetails)
@@ -330,23 +304,25 @@ public class FileData
 {
     public bool HashInDatabase = false;
     public bool FilePathInDatabase = false;
-    public string FilePath = String.Empty;
+    public string FilePath = string.Empty;
     public string? AlternateFileLocation = null;
     public bool QueueForUpload = false;
     public bool MarkedForDeletion = false;
-    public byte[] HashCode;
+    public byte[]? HashCode = null;
+    public byte[]? RawBytes = null;
 
     /// <param name="hashInDatabase">Boolean that represents if the file's hash is present in the database.</param>
     /// <param name="filePathInDatabase">Boolean that represents if the file name and path is found in the database.</param>
     /// <param name="filePath">File name and path.</param>
     /// <param name="hashCode">Byte array generated from a hash-algorithm.</param>
     /// <param name="alternateFileLocation">Current location of file if not equal to <paramref name="filePath"/>.</param>
-    public FileData(bool hashInDatabase, bool filePathInDatabase, string filePath, byte[] hashCode, string? alternateFileLocation = null)
+    public FileData(bool hashInDatabase, bool filePathInDatabase, string filePath, byte[]? hashCode, string? alternateFileLocation = null, byte[]? rawBytes = null)
     {
         HashInDatabase = hashInDatabase;
         FilePathInDatabase = filePathInDatabase;
         FilePath = filePath;
         HashCode = hashCode;
+        RawBytes = rawBytes;
         AlternateFileLocation = alternateFileLocation;
 
         if (!FilePathInDatabase) QueueForUpload = true;
