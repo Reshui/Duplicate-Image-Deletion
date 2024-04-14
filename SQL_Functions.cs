@@ -1,6 +1,5 @@
 namespace SQL_Functions;
 using Microsoft.Data.Sqlite;
-using SQLitePCL;
 
 public class SQL_Connector
 {
@@ -35,12 +34,10 @@ public class SQL_Connector
     }
     public int ReturnNumberOfRecords()
     {
-        using (var command = Connection.CreateCommand())
-        {
-            command.CommandText = $"SELECT COUNT(*) FROM {HashTableName};";
+        using var command = Connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(FileName) FROM {HashTableName};";
 
-            return Convert.ToInt32(command.ExecuteScalar());
-        }
+        return Convert.ToInt32(command.ExecuteScalar());
     }
     public FileData DoesHashExistAsync(byte[] hashCode, string imgPath)
     {
@@ -108,18 +105,15 @@ public class SQL_Connector
     {
         var filePaths = new HashSet<string>();
 
-        using (var command = Connection.CreateCommand())
-        {
-            command.CommandText = @$"SELECT FileName FROM {HashTableName};";
+        using var command = Connection.CreateCommand();
 
-            using (var reader = command.ExecuteReader())
-            {
-                while (reader.Read())
-                {
-                    string oPath = reader.GetString(0);
-                    filePaths.Add(oPath);
-                }
-            }
+        command.CommandText = @$"SELECT FileName FROM {HashTableName};";
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            string oPath = reader.GetString(0);
+            filePaths.Add(oPath);
         }
         return filePaths;
     }
@@ -153,15 +147,11 @@ public class SQL_Connector
 
                     var imgfile = new FileData(true, true, filePath, byteCode, alternatePath);
 
-                    if (!wantedFiles.ContainsKey(byteCode))
+                    if (!wantedFiles.TryGetValue(byteCode, out List<FileData>? duplicatedList))
                     {
-                        wantedFiles.Add(byteCode, new List<FileData> { imgfile });
+                        duplicatedList = wantedFiles[byteCode] = new();
                     }
-                    else
-                    {
-                        wantedFiles[byteCode].Add(imgfile);
-                    }
-
+                    duplicatedList.Add(imgfile);
                 }
             }
         }
@@ -206,71 +196,83 @@ public class SQL_Connector
         }
         transaction.Commit();
     }
+    public async Task InsertIntoDatabaseAsync(FileData fileToUpload)
+    {
+        using var command = Connection.CreateCommand();
 
+        command.CommandText =
+        @$"INSERT INTO {HashTableName} (FileName, AlternatePathActive, HashCode)
+                VALUES ($filePath, $alternatePathValid, $byteArray);";
+
+        command.Parameters.AddWithValue("$alternatePathValid", _useOriginal);
+        command.Parameters.AddWithValue("$filePath", fileToUpload.FilePath);
+        command.Parameters.AddWithValue("$byteArray", fileToUpload.HashCode);
+
+        try
+        {
+            await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+        catch (SqliteException)
+        {
+            Console.WriteLine(fileToUpload.FilePath);
+            throw;
+        }
+    }
     public void UpdateAlternatePath(List<FileData> fileDetails)
     {
+        using var transaction = Connection.BeginTransaction();
+        using var command = Connection.CreateCommand();
 
-        using (var transaction = Connection.BeginTransaction())
-        {
-            using (var command = Connection.CreateCommand())
-            {
-                command.CommandText =
-                @$"Update {HashTableName}
+        command.CommandText =
+        @$"Update {HashTableName}
                 SET AlternatePath = $newPath, AlternatePathActive = $useAlternate
                 WHERE FileName = $originalPath;";
 
-                var newAlternatePathParam = command.CreateParameter();
-                var originalPathParam = command.CreateParameter();
-                var useAlternateParam = command.CreateParameter();
+        var newAlternatePathParam = command.CreateParameter();
+        var originalPathParam = command.CreateParameter();
+        var useAlternateParam = command.CreateParameter();
 
-                useAlternateParam.ParameterName = "$useAlternate";
-                originalPathParam.ParameterName = "$originalPath";
-                newAlternatePathParam.ParameterName = "$newPath";
+        useAlternateParam.ParameterName = "$useAlternate";
+        originalPathParam.ParameterName = "$originalPath";
+        newAlternatePathParam.ParameterName = "$newPath";
 
-                command.Parameters.Add(useAlternateParam);
-                command.Parameters.Add(originalPathParam);
-                command.Parameters.Add(newAlternatePathParam);
+        command.Parameters.Add(useAlternateParam);
+        command.Parameters.Add(originalPathParam);
+        command.Parameters.Add(newAlternatePathParam);
 
-                foreach (FileData imgfile in fileDetails)
-                {
-                    useAlternateParam.Value = (imgfile.AlternateFileLocation == null) ? _useOriginal : _useAlternate;
-                    originalPathParam.Value = imgfile.FilePath;
-                    newAlternatePathParam.Value = imgfile.AlternateFileLocation;
+        foreach (FileData imgfile in fileDetails)
+        {
+            useAlternateParam.Value = (imgfile.AlternateFileLocation == null) ? _useOriginal : _useAlternate;
+            originalPathParam.Value = imgfile.FilePath;
+            newAlternatePathParam.Value = imgfile.AlternateFileLocation;
 
-                    command.ExecuteNonQuery();
-                }
-            }
-
-            transaction.Commit();
+            command.ExecuteNonQuery();
         }
-
+        transaction.Commit();
     }
 
     /// <summary>Deletes entries in database that match a given file path in a given list.</summary>
     /// <param name="fileDetails">A list of FileData objects that contain information for entries to be deleted from the database.</param> 
     public void DeleteEntriesFromDatabase(List<FileData> fileDetails)
     {
-        using (var transaction = Connection.BeginTransaction())
-        {
-            using (var command = Connection.CreateCommand())
-            {
-                command.CommandText =
-                @$"DELETE FROM {HashTableName}
+        using var transaction = Connection.BeginTransaction();
+        using var command = Connection.CreateCommand();
+
+        command.CommandText =
+        @$"DELETE FROM {HashTableName}
                 WHERE FileName = $originalPath;";
 
-                var originalPathParam = command.CreateParameter();
-                originalPathParam.ParameterName = "$originalPath";
+        var originalPathParam = command.CreateParameter();
+        originalPathParam.ParameterName = "$originalPath";
 
-                command.Parameters.Add(originalPathParam);
+        command.Parameters.Add(originalPathParam);
 
-                foreach (FileData file in fileDetails)
-                {
-                    originalPathParam.Value = file.FilePath;
-                    command.ExecuteNonQuery();
-                }
-            }
-            transaction.Commit();
+        foreach (FileData file in fileDetails)
+        {
+            originalPathParam.Value = file.FilePath;
+            command.ExecuteNonQuery();
         }
+        transaction.Commit();
     }
 }
 class ByteArrayEquality : IEqualityComparer<byte[]>
@@ -300,31 +302,3 @@ class ByteArrayEquality : IEqualityComparer<byte[]>
     }
 }
 
-public class FileData
-{
-    public bool HashInDatabase = false;
-    public bool FilePathInDatabase = false;
-    public string FilePath = string.Empty;
-    public string? AlternateFileLocation = null;
-    public bool QueueForUpload = false;
-    public bool MarkedForDeletion = false;
-    public byte[]? HashCode = null;
-    public byte[]? RawBytes = null;
-
-    /// <param name="hashInDatabase">Boolean that represents if the file's hash is present in the database.</param>
-    /// <param name="filePathInDatabase">Boolean that represents if the file name and path is found in the database.</param>
-    /// <param name="filePath">File name and path.</param>
-    /// <param name="hashCode">Byte array generated from a hash-algorithm.</param>
-    /// <param name="alternateFileLocation">Current location of file if not equal to <paramref name="filePath"/>.</param>
-    public FileData(bool hashInDatabase, bool filePathInDatabase, string filePath, byte[]? hashCode, string? alternateFileLocation = null, byte[]? rawBytes = null)
-    {
-        HashInDatabase = hashInDatabase;
-        FilePathInDatabase = filePathInDatabase;
-        FilePath = filePath;
-        HashCode = hashCode;
-        RawBytes = rawBytes;
-        AlternateFileLocation = alternateFileLocation;
-
-        if (!FilePathInDatabase) QueueForUpload = true;
-    }
-}
