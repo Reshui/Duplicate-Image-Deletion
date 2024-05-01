@@ -39,12 +39,14 @@ foreach (bool editWallpapers in new bool[] { true, false })
         */
         var computeHashBlock = new TransformBlock<string, FileData>(async filePath =>
         {
+            //Console.WriteLine($"Starting {Path.GetFileName(filePath)}");
             using FileStream fileStream = File.OpenRead(filePath);
             using var myHash = SHA512.Create();
-            return new FileData(false, false, filePath, await myHash.ComputeHashAsync(fileStream, CancellationToken.None).ConfigureAwait(false));
+            var fileData = new FileData(false, false, filePath, await myHash.ComputeHashAsync(fileStream).ConfigureAwait(false));
+            //Console.WriteLine($"Finished {Path.GetFileName(filePath)}");
+            return fileData;
 
-        }, new ExecutionDataflowBlockOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, BoundedCapacity = MaxBounded });
-
+        }, new ExecutionDataflowBlockOptions { MaxDegreeOfParallelism = 3, BoundedCapacity = MaxBounded });
 
         var uploadBlock = new ActionBlock<FileData>(sqlC.InsertIntoDatabaseAsync, new ExecutionDataflowBlockOptions { BoundedCapacity = MaxBounded });
 
